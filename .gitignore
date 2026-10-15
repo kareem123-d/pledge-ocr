@@ -1,0 +1,14 @@
+venv*/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+dataset_out/
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+diag.py
+openapi.json

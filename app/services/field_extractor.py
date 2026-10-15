@@ -258,8 +258,7 @@ def _value_for_label(
             cand.lines = cand.lines + [g.line for g in extra]
             cand.match_confidence *= 0.9
     return cand
-
-
+    
 def _embedded_candidate(rule: FieldRule, lines: list[OcrLine], owners: dict[int, tuple[str, float, int]]) -> Candidate | None:
     for line in lines:
         owner = owners.get(line.index)

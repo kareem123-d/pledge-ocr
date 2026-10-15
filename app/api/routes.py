@@ -1,23 +1,22 @@
+import asyncio
 import logging
 import time
-import asyncio
+
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.schemas.common import ErrorResponse, HealthResponse
-from app.schemas.pledge_slip import DocumentInfo, OcrResult, PledgeSlipResponse
+from app.schemas.pledge_slip import PledgeSlipResponse
 from app.services.file_validator import read_upload_limited, validate_upload
-from app.services.review_service import build_review
-from app.services.slip_analyzer import analyze_document
+from app.services.job_queue import job_manager
 from app.utils.request_context import get_request_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MULTIPART_OVERHEAD = 1024 * 1024
-_waiting = 0
 ERROR_RESPONSES = {code: {"model": ErrorResponse} for code in (400, 413, 415, 422, 500, 503)}
 
 
@@ -32,6 +31,7 @@ async def health(request: Request) -> HealthResponse:
         handwritingModel=service.handwriting_status if service else "disabled",
     )
 
+
 @router.post(
     "/pledge-slips/upload",
     response_model=PledgeSlipResponse,
@@ -42,13 +42,9 @@ async def health(request: Request) -> HealthResponse:
 async def upload_pledge_slip(
     request: Request,
     file: UploadFile = File(..., description="JPG, JPEG, PNG or PDF, max 15 MB"),
-) -> PledgeSlipResponse:
+):
     settings = get_settings()
     started = time.perf_counter()
-    global _waiting
-    if _waiting >= settings.ocr_queue_max:
-        await file.close()
-        raise AppError(503, "server_busy", "The server is busy. Please try again in a minute.")
 
     content_length = request.headers.get("content-length")
     if content_length and content_length.isdigit() and int(content_length) > settings.max_upload_bytes + MULTIPART_OVERHEAD:
@@ -69,41 +65,16 @@ async def upload_pledge_slip(
         max_pdf_pages=settings.max_pdf_pages,
     )
 
-    service = request.app.state.ocr_service
-    _waiting += 1
+    job = job_manager.submit(validated, request.app.state.ocr_service)
+    if job is None:
+        raise AppError(503, "server_busy", "The queue is full. Please try again in a minute.")
     try:
-        await asyncio.wait_for(service.semaphore.acquire(), timeout=settings.ocr_queue_timeout)
+        await asyncio.wait_for(job.event.wait(), timeout=600)
     except asyncio.TimeoutError:
         raise AppError(503, "server_busy", "The server is busy. Please try again in a minute.")
-    finally:
-        _waiting -= 1
-    try:
-        analysis = await run_in_threadpool(analyze_document, validated, service, settings)
-    finally:
-        service.semaphore.release()
+    if job.status == "failed":
+        raise job.exception
 
-    result, extracted = analysis.pipeline, analysis.extracted
-    review = build_review(extracted, settings.mandatory_field_list, analysis.warnings)
-
-    response = PledgeSlipResponse(
-        requestId=get_request_id(request),
-        document=DocumentInfo(
-            filename=validated.filename,
-            fileType=validated.kind,
-            pageCount=validated.page_count,
-            pages=result.pages,
-        ),
-        extractedData=extracted,
-        ocr=OcrResult(rawText="\n".join(line.text for line in result.lines), lines=result.lines),
-        review=review,
-    )
-    logger.info(
-        "Processed %s upload: %d page(s), %d line(s), %d item(s), review=%s in %.2fs",
-        validated.kind,
-        validated.page_count,
-        len(result.lines),
-        len(extracted.ornamentDetails),
-        review.required,
-        time.perf_counter() - started,
-    )
-    return response
+    job.result["requestId"] = get_request_id(request)
+    logger.info("Upload %s finished in %.2fs", validated.filename, time.perf_counter() - started)
+    return job.result
